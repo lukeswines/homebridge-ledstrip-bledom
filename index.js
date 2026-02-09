@@ -44,6 +44,13 @@ function LedStrip(log, config, api) {
 }
 
 LedStrip.prototype = {
+  ensureDevice: function (callback) {
+    if (this.device) return true;
+    const err = new Error('Missing device UUID in config.');
+    this.log(err.message);
+    if (callback) callback(err);
+    return false;
+  },
   getServices: function () {
     if (!this.bulb) return [];
     this.log('Homekit asked to report service');
@@ -52,35 +59,43 @@ LedStrip.prototype = {
     return [infoService, this.bulb];
   },
   getPower: function (callback) {
+    if (!this.ensureDevice(callback)) return;
     this.log('Homekit Asked Power State', this.device.connected);
     callback(null, this.device.power);
   },
   setPower: function (on, callback) {
+    if (!this.ensureDevice(callback)) return;
     this.log('Homekit Gave New Power State' + ' ' + on);
     this.device.set_power(on);
     callback(null);
   },
   getBrightness: function (callback) {
+    if (!this.ensureDevice(callback)) return;
     this.log('Homekit Asked Brightness');
     callback(null, this.device.brightness);
   },
   setBrightness: function (brightness, callback) {
+    if (!this.ensureDevice(callback)) return;
     this.log('Homekit Set Brightness', brightness);
     this.device.set_brightness(brightness);
     callback(null);
   },
   getHue: function (callback) {
+    if (!this.ensureDevice(callback)) return;
     callback(null, this.device.hue);
   },
   setHue: function (hue, callback) {
+    if (!this.ensureDevice(callback)) return;
     this.log('Homekit Set Hue', hue);
     this.device.set_hue(hue);
     callback(null);
   },
   getSaturation: function (callback) {
+    if (!this.ensureDevice(callback)) return;
     callback(null, this.device.saturation);
   },
   setSaturation: function (saturation, callback) {
+    if (!this.ensureDevice(callback)) return;
     this.log('Homekit Set Saturation', saturation);
     this.device.set_saturation(saturation);
     callback(null);

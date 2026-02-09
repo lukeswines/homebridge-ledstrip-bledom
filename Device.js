@@ -4,17 +4,6 @@ function log(message) {
   console.log(`[homebridge-ledstrip]:`, message);
 }
 
-// Monkey patch console.warn to catch critical noble warnings
-const originalWarn = console.warn;
-console.warn = function (...args) {
-  const message = args.join(" ");
-  if (message.includes("unknown peripheral")) {
-    log("Critical noble failure. Exiting to trigger Homebridge restart...");
-    process.exit(1); // Exit to let Homebridge auto-restart the plugin
-  }
-  originalWarn.apply(console, args);
-};
-
 function hslToRgb(h, s, l) {
   let r, g, b;
 
@@ -50,137 +39,182 @@ module.exports = class Device {
     this.saturation = 0;
     this.l = 0.5;
     this.peripheral = undefined;
-    this.debounceTimer = null;
+    this.write = undefined;
+    this.connectPromise = null;
+    this.commandQueue = Promise.resolve();
+    this.scanning = false;
 
     noble.on("stateChange", (state) => {
       if (state == "poweredOn") {
-        noble.startScanningAsync();
+        this.startScanning();
       } else {
-        if (this.peripheral) this.peripheral.disconnect();
+        this.stopScanning();
+        if (this.peripheral) this.peripheral.disconnectAsync().catch(() => {});
         this.connected = false;
+        this.write = undefined;
       }
     });
 
     noble.on("discover", async (peripheral) => {
       if (peripheral.uuid === this.uuid) {
-        if (this.connected || (this.peripheral && this.peripheral.state === 'connecting')) {
-          return; // Don't keep trying if we're already connected or connecting
-        }
-
+        if (this.connected || this.connectPromise) return;
         log(`Discovered target device: ${peripheral.uuid}`);
         this.peripheral = peripheral;
-        noble.stopScanning();
+        this.stopScanning();
+        peripheral.once("disconnect", () => {
+          this.connected = false;
+          this.write = undefined;
+          this.peripheral = undefined;
+          this.startScanning();
+        });
 
         try {
-          await this.connectAndGetWriteCharacteristics();
+          await this.ensureConnected();
         } catch (err) {
           log(`Connect failed after discovery: ${err.message}`);
           this.peripheral = undefined;
           this.connected = false;
-          noble.startScanningAsync(); // Resume scanning
+          this.startScanning(); // Resume scanning
         }
       }
     });
   }
 
-  async connectAndGetWriteCharacteristics() {
+  async ensureConnected() {
     if (!this.peripheral) return;
+    if (this.connected && this.write) return;
+    if (this.connectPromise) return this.connectPromise;
 
-    if (this.peripheral.state !== 'connected') {
-      log(`Connecting to ${this.peripheral.uuid}...`);
-      try {
+    this.connectPromise = (async () => {
+      if (this.peripheral.state !== "connected") {
+        log(`Connecting to ${this.peripheral.uuid}...`);
         await this.peripheral.connectAsync();
         log(`Connected`);
-        this.connected = true;
-
-        const { characteristics } =
-          await this.peripheral.discoverSomeServicesAndCharacteristicsAsync(
-            ["fff0"],
-            ["fff3"]
-          );
-        this.write = characteristics[0];
-      } catch (err) {
-        log(`Connection error: ${err.message}`);
-        throw err;
       }
-    }
+
+      const { characteristics } =
+        await this.peripheral.discoverSomeServicesAndCharacteristicsAsync(
+          ["fff0"],
+          ["fff3"]
+        );
+      this.write = characteristics[0];
+      this.connected = true;
+    })().catch((err) => {
+      this.connected = false;
+      this.write = undefined;
+      log(`Connection error: ${err.message}`);
+      throw err;
+    }).finally(() => {
+      this.connectPromise = null;
+    });
+
+    return this.connectPromise;
   }
 
-  debounceDisconnect() {
-    clearTimeout(this.debounceTimer);
-    this.debounceTimer = setTimeout(async () => {
-      if (this.peripheral) {
-        log("Disconnecting...");
-        await this.peripheral.disconnectAsync();
-        log("Disconnected");
+  startScanning() {
+    if (this.scanning) return;
+    this.scanning = true;
+    noble.startScanningAsync().catch((err) => {
+      this.scanning = false;
+      log(`Scan start error: ${err.message}`);
+    });
+  }
+
+  stopScanning() {
+    if (!this.scanning) return;
+    this.scanning = false;
+    noble.stopScanning();
+  }
+
+  enqueueCommand(label, buffer, onSuccess) {
+    this.commandQueue = this.commandQueue
+      .then(async () => {
+        await this.waitForReady();
+        if (!this.write) throw new Error("Missing write characteristic");
+        return new Promise((resolve, reject) => {
+          this.write.write(buffer, true, (err) => {
+            if (err) return reject(err);
+            resolve();
+          });
+        });
+      })
+      .then(() => {
+        if (onSuccess) onSuccess();
+        log(`${label} command sent`);
+      })
+      .catch((err) => {
+        log(`${label} command failed: ${err.message}`);
         this.connected = false;
+        this.write = undefined;
+        this.startScanning();
+      });
+
+    return this.commandQueue;
+  }
+
+  async waitForReady(timeoutMs = 10000) {
+    const start = Date.now();
+    this.startScanning();
+
+    while (Date.now() - start < timeoutMs) {
+      if (this.connected && this.write) return;
+
+      if (this.peripheral && !this.connectPromise && !this.connected) {
+        try {
+          await this.ensureConnected();
+        } catch (_) {
+          // Ignore and keep waiting until timeout.
+        }
+      } else if (this.connectPromise) {
+        try {
+          await this.connectPromise;
+        } catch (_) {
+          // Ignore and keep waiting until timeout.
+        }
       }
-    }, 5000);
+
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+
+    throw new Error("Timed out waiting for device");
   }
 
   async set_power(status) {
-    if (!this.connected) await this.connectAndGetWriteCharacteristics();
-    if (this.write) {
-      const buffer = Buffer.from(
-        `7e0404${status ? "01" : "00"}00${status ? "01" : "00"}ff00ef`,
-        "hex"
-      );
-      log("Power command sent");
-      this.write.write(buffer, true, (err) => {
-        if (err) console.log("Error:", err);
-        this.power = status;
-//        this.debounceDisconnect();
-      });
-    }
+    const buffer = Buffer.from(
+      `7e0404${status ? "01" : "00"}00${status ? "01" : "00"}ff00ef`,
+      "hex"
+    );
+    return this.enqueueCommand("Power", buffer, () => {
+      this.power = status;
+    });
   }
 
   async set_brightness(level) {
     if (level > 100 || level < 0) return;
-    if (!this.connected) await this.connectAndGetWriteCharacteristics();
-    if (this.write) {
-      const level_hex = ("0" + level.toString(16)).slice(-2);
-      const buffer = Buffer.from(`7e0401${level_hex}ffffff00ef`, "hex");
-      log("Brightness command sent");
-      this.write.write(buffer, true, (err) => {
-        if (err) console.log("Error:", err);
-        this.brightness = level;
-//        this.debounceDisconnect();
-      });
-    }
+    const level_hex = ("0" + level.toString(16)).slice(-2);
+    const buffer = Buffer.from(`7e0401${level_hex}ffffff00ef`, "hex");
+    return this.enqueueCommand("Brightness", buffer, () => {
+      this.brightness = level;
+    });
   }
 
   async set_rgb(r, g, b) {
-    if (!this.connected) await this.connectAndGetWriteCharacteristics();
-    if (this.write) {
-      const rhex = ("0" + r.toString(16)).slice(-2);
-      const ghex = ("0" + g.toString(16)).slice(-2);
-      const bhex = ("0" + b.toString(16)).slice(-2);
-      const buffer = Buffer.from(`7e070503${rhex}${ghex}${bhex}10ef`, "hex");
-      log("Colour command sent");
-      this.write.write(buffer, true, (err) => {
-        if (err) console.log("Error:", err);
-//        this.debounceDisconnect();
-      });
-    }
+    const rhex = ("0" + r.toString(16)).slice(-2);
+    const ghex = ("0" + g.toString(16)).slice(-2);
+    const bhex = ("0" + b.toString(16)).slice(-2);
+    const buffer = Buffer.from(`7e070503${rhex}${ghex}${bhex}10ef`, "hex");
+    return this.enqueueCommand("Colour", buffer);
   }
 
   async set_hue(hue) {
-    if (!this.connected) await this.connectAndGetWriteCharacteristics();
-    if (this.write) {
-      this.hue = hue;
-      const rgb = hslToRgb(hue / 360, this.saturation / 100, this.l);
-      await this.set_rgb(rgb[0], rgb[1], rgb[2]);
-//      this.debounceDisconnect();
-    }
+    this.hue = hue;
+    const rgb = hslToRgb(hue / 360, this.saturation / 100, this.l);
+    return this.set_rgb(rgb[0], rgb[1], rgb[2]);
   }
 
   async set_saturation(saturation) {
-    if (!this.connected) await this.connectAndGetWriteCharacteristics();
-    if (this.write) {
-      this.saturation = saturation;
-      const rgb = hslToRgb(this.hue / 360, saturation / 100, this.l);
-      await this.set_rgb(rgb[0], rgb[1], rgb[2]);
-//      this.debounceDisconnect();
-    }
+    this.saturation = saturation;
+    const rgb = hslToRgb(this.hue / 360, saturation / 100, this.l);
+    return this.set_rgb(rgb[0], rgb[1], rgb[2]);
   }
 };
